@@ -263,7 +263,7 @@ const populateAnnualStockPercentages = (state) => {
     return annualStockPercentages;
 };
 
-const calculatePrognosis = (state) => {
+const calculatePrognosis = (state, simButtonActive = false, simulatedReturns = null) => {
     const labels = [];
     const data = {
         hovedstol: [], avkastning: [], sparing: [], nettoUtbetaling: [],
@@ -282,8 +282,8 @@ const calculatePrognosis = (state) => {
     let untaxedBondReturnPool = 0; // Akkumulerte ubeskattede rentegevinster (Privat + utsatt rente-skatt)
 
     const taxesEnabled = state.taxCalculationEnabled !== false;
-    const stockReturnRate = state.stockReturnRate / 100;
-    const bondReturnRate = state.bondReturnRate / 100;
+    // Bruk simulerte avkastninger hvis sim-knappen er aktiv, ellers bruk forventet avkastning
+    const useSimulatedReturns = simButtonActive && simulatedReturns && simulatedReturns.stockReturns.length > 0;
     const shieldingRate = state.shieldingRate / 100;
     const taxRate = state.manualStockTaxRate / 100; // Bruker manuell aksjebeskatning
     const bondTaxRate = state.manualBondTaxRate / 100; // Bruker manuell kapitalskatt
@@ -413,8 +413,19 @@ const calculatePrognosis = (state) => {
         if (currentPortfolioValue > 0) {
             const stockValue = currentPortfolioValue * (annualStockPercentage / 100);
             const bondValue = currentPortfolioValue * (annualBondPercentage / 100);
-            const grossStockReturn = stockValue * stockReturnRate;
-            const grossBondReturn = bondValue * bondReturnRate;
+            
+            // Bruk simulerte avkastninger hvis aktivert, ellers bruk forventet avkastning
+            let stockReturnRateForYear, bondReturnRateForYear;
+            if (useSimulatedReturns && i < simulatedReturns.stockReturns.length) {
+                stockReturnRateForYear = simulatedReturns.stockReturns[i] / 100;
+                bondReturnRateForYear = simulatedReturns.bondReturns[i] / 100;
+            } else {
+                stockReturnRateForYear = state.stockReturnRate / 100;
+                bondReturnRateForYear = state.bondReturnRate / 100;
+            }
+            
+            const grossStockReturn = stockValue * stockReturnRateForYear;
+            const grossBondReturn = bondValue * bondReturnRateForYear;
             totalGrossReturn = grossStockReturn + grossBondReturn;
 
             // Fordel KPI og rådgivningshonorar proporsjonalt mellom aksjer og renter
@@ -454,14 +465,14 @@ const calculatePrognosis = (state) => {
                 const p2StockPct = state.row2StockAllocation || 0;
                 const p3StockPct = 0; // Likviditetsfond
                
-                const p1Return = portfolio1Value * ((p1StockPct / 100) * stockReturnRate + ((100 - p1StockPct) / 100) * bondReturnRate) -
+                const p1Return = portfolio1Value * ((p1StockPct / 100) * stockReturnRateForYear + ((100 - p1StockPct) / 100) * bondReturnRateForYear) -
                                  portfolio1Value * kpiRate - portfolio1Value * advisoryFeeRate -
-                                 (portfolio1Value * ((100 - p1StockPct) / 100) * bondReturnRate * (useDeferredBondTax ? 0 : (taxesEnabled ? bondTaxRate : 0)));
-                const p2Return = portfolio2Value * ((p2StockPct / 100) * stockReturnRate + ((100 - p2StockPct) / 100) * bondReturnRate) -
+                                 (portfolio1Value * ((100 - p1StockPct) / 100) * bondReturnRateForYear * (useDeferredBondTax ? 0 : (taxesEnabled ? bondTaxRate : 0)));
+                const p2Return = portfolio2Value * ((p2StockPct / 100) * stockReturnRateForYear + ((100 - p2StockPct) / 100) * bondReturnRateForYear) -
                                  portfolio2Value * kpiRate - portfolio2Value * advisoryFeeRate -
-                                 (portfolio2Value * ((100 - p2StockPct) / 100) * bondReturnRate * (useDeferredBondTax ? 0 : (taxesEnabled ? bondTaxRate : 0)));
-                const p3Return = portfolio3Value * bondReturnRate - portfolio3Value * kpiRate - portfolio3Value * advisoryFeeRate -
-                                 (portfolio3Value * bondReturnRate * (useDeferredBondTax ? 0 : (taxesEnabled ? bondTaxRate : 0)));
+                                 (portfolio2Value * ((100 - p2StockPct) / 100) * bondReturnRateForYear * (useDeferredBondTax ? 0 : (taxesEnabled ? bondTaxRate : 0)));
+                const p3Return = portfolio3Value * bondReturnRateForYear - portfolio3Value * kpiRate - portfolio3Value * advisoryFeeRate -
+                                 (portfolio3Value * bondReturnRateForYear * (useDeferredBondTax ? 0 : (taxesEnabled ? bondTaxRate : 0)));
                
                 portfolio1Value += p1Return;
                 portfolio2Value += p2Return;
@@ -970,7 +981,7 @@ const EventRow = ({ event, onUpdate, onRemove, maxYear }) => {
 };
 
 const CustomLegend = ({ items }) => (
-    <div className="flex justify-center flex-wrap gap-x-6 gap-y-2 mt-4 text-[#333333]/90 text-sm">
+    <div className="flex justify-center flex-wrap gap-x-12 gap-y-2 mt-4 text-[#333333]/90 text-sm">
         {items.map(item => (
             <div key={item.label} className="flex items-center">
                 <div className="w-4 h-4 rounded-sm mr-2" style={{ backgroundColor: item.color }}></div>
@@ -1020,6 +1031,10 @@ const [copied, setCopied] = useState(false);
 const [showInputModal, setShowInputModal] = useState(false);
 const [inputText, setInputText] = useState('');
     const [showAssumptionsGraphic, setShowAssumptionsGraphic] = useState(false);
+    const [showSimulation, setShowSimulation] = useState(false);
+    const [simButtonActive, setSimButtonActive] = useState(false);
+    const [simulationKey, setSimulationKey] = useState(0); // Brukes for å tvinge regenerering av simulering
+    const [savedSimulatedReturns, setSavedSimulatedReturns] = useState({ stockReturns: [], bondReturns: [] }); // Lagrer simulerte verdier
     const [advisoryInputValue, setAdvisoryInputValue] = useState(INITIAL_APP_STATE.advisoryFeeRate.toFixed(2).replace('.', ','));
     const [waterfallMode, setWaterfallMode] = useState(false);
 
@@ -1124,7 +1139,65 @@ const [inputText, setInputText] = useState('');
         setState(s => ({ ...s, events: s.events.filter(e => e.id !== id) }));
     }, []);
 
-    const prognosis = useMemo(() => calculatePrognosis(state), [state]);
+    // Beregn simulerte årlige avkastninger basert på aksjeandel
+    // Må beregnes før prognosis for å unngå sirkulær avhengighet
+    const generateNormalRandom = (mean, stdDev) => {
+        // Box-Muller transformasjon for å generere normalfordelte tall
+        const u1 = Math.random();
+        const u2 = Math.random();
+        const z0 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        return mean + z0 * stdDev;
+    };
+
+    // Beregn aksjeandel basert på state (uten å avhenge av prognosis)
+    const annualStockPercentagesForSim = useMemo(() => {
+        return populateAnnualStockPercentages(state);
+    }, [state]);
+
+    // Generer ny simulering kun når simulationKey endres (når Sim-knappen aktiveres)
+    // Viktig: Kun simulationKey er avhengighet, ikke state-verdier
+    const simulatedReturns = useMemo(() => {
+        // Hvis simulationKey er 0, returner tom array (ingen simulering gjort ennå)
+        if (simulationKey === 0) return { stockReturns: [], bondReturns: [] };
+        
+        // Bruk state-verdiene på tidspunktet når simuleringen genereres
+        const totalYears = (state.investmentYears || 0) + (state.payoutYears || 0);
+        if (totalYears === 0) return { stockReturns: [], bondReturns: [] };
+        
+        const stockReturns = [];
+        const bondReturns = [];
+        const stockStdDev = 12; // 12% standardavvik for aksjer
+        const bondStdDev = 3; // 3% standardavvik for renter
+        const stockMean = state.stockReturnRate || 8.0; // Forventet avkastning aksjer
+        const bondMean = state.bondReturnRate || 5.0; // Forventet avkastning renter
+        
+        // Simuler for nøyaktig totalYears antall år
+        for (let i = 0; i < totalYears; i++) {
+            // Simuler avkastning for aksjer og renter
+            const simulatedStockReturn = generateNormalRandom(stockMean, stockStdDev);
+            const simulatedBondReturn = generateNormalRandom(bondMean, bondStdDev);
+            
+            stockReturns.push(Math.round(simulatedStockReturn * 100) / 100); // Rund av til 2 desimaler
+            bondReturns.push(Math.round(simulatedBondReturn * 100) / 100); // Rund av til 2 desimaler
+        }
+        
+        return { stockReturns, bondReturns };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [simulationKey]); // Kun simulationKey som avhengighet - state-verdiene leses direkte inne i useMemo
+
+    // Lagre simulerte verdier når de genereres
+    useEffect(() => {
+        if (simulationKey > 0 && simulatedReturns.stockReturns.length > 0) {
+            setSavedSimulatedReturns(simulatedReturns);
+        }
+    }, [simulatedReturns, simulationKey]);
+
+    // Bruk lagrede simulerte verdier hvis Sim-knappen er aktiv, ellers bruk de nye
+    const activeSimulatedReturns = simButtonActive && savedSimulatedReturns.stockReturns.length > 0 
+        ? savedSimulatedReturns 
+        : simulatedReturns;
+    
+    const prognosis = useMemo(() => calculatePrognosis(state, simButtonActive, activeSimulatedReturns), [state, simButtonActive, activeSimulatedReturns]);
 
 // --- Output generation & clipboard helpers --- //
 const generateOutputText = useCallback(() => {
@@ -1590,7 +1663,7 @@ return () => document.removeEventListener('keydown', onKey);
         if (!hasPayoutYears) return;
 
         const simulateFinalPortfolio = (annualSavingsValue) => {
-            const p = calculatePrognosis({ ...state, annualSavings: annualSavingsValue });
+            const p = calculatePrognosis({ ...state, annualSavings: annualSavingsValue }, false, null);
             // Bruk sluttverdien etter avkastning og uttak i siste utbetalingsår
             // Dette sikrer at porteføljen går til null etter det spesifiserte antall år
             return p.finalPortfolioValue;
@@ -1643,7 +1716,7 @@ return () => document.removeEventListener('keydown', onKey);
                 ...state, 
                 desiredAnnualConsumptionPayout: consumptionPayoutValue,
                 desiredAnnualWealthTaxPayout: 0  // Sett hele beløpet i forbruksutbetaling
-            });
+            }, false, null);
             // Bruk sluttverdien etter avkastning og uttak i siste utbetalingsår
             // Dette sikrer at porteføljen går til null etter det spesifiserte antall år
             return p.finalPortfolioValue;
@@ -1702,7 +1775,7 @@ return () => document.removeEventListener('keydown', onKey);
             const p = calculatePrognosis({ 
                 ...state, 
                 initialPortfolioSize: portfolio1Size
-            });
+            }, false, null);
             // Bruk sluttverdien etter avkastning og uttak i siste utbetalingsår
             // Dette sikrer at porteføljen går til null etter det spesifiserte antall år
             return p.finalPortfolioValue;
@@ -1792,10 +1865,26 @@ return () => document.removeEventListener('keydown', onKey);
             }
         },
         scales: {
-            x: { stacked: true, grid: { display: false }, ticks: { color: '#333333' } },
+            x: { 
+                stacked: true, 
+                grid: { display: false }, 
+                ticks: { 
+                    color: '#333333',
+                    font: {
+                        size: 12 // Økt med 20% fra 10 (10 * 1.2 = 12)
+                    }
+                } 
+            },
             y: {
-                stacked: true, grid: { color: '#DDDDDD' },
-                ticks: { color: '#333333', callback: (value) => `${(value / 1000000).toLocaleString('nb-NO')} MNOK` }
+                stacked: true, 
+                grid: { color: 'rgba(221, 221, 221, 0.3)' },
+                ticks: { 
+                    color: '#333333', 
+                    callback: (value) => `${(value / 1000000).toLocaleString('nb-NO')} MNOK`,
+                    font: {
+                        size: 12 // Økt med 20% fra 10 (10 * 1.2 = 12)
+                    }
+                }
             }
         }
     };
@@ -1865,8 +1954,9 @@ return () => document.removeEventListener('keydown', onKey);
         // Beregn avkastning individuelt for hver portefølje basert på deres faktiske verdi og aksjeandel
         const kpi = state.kpiRate / 100;
         const fee = state.advisoryFeeRate / 100;
-        const stockRetRate = state.stockReturnRate / 100;
-        const bondRetRate = state.bondReturnRate / 100;
+        
+        // Bruk simulerte avkastninger hvis Sim-knappen er aktiv
+        const useSimulated = simButtonActive && activeSimulatedReturns && activeSimulatedReturns.stockReturns.length > 0;
        
         // Track portfolio values at start of each year (before returns) to calculate returns correctly
         let portfolio1Val = state.initialPortfolioSize || 0;
@@ -1889,6 +1979,16 @@ return () => document.removeEventListener('keydown', onKey);
                 portfolio1Val += eventInflow;
             }
            
+            // Bruk simulerte avkastninger for dette året hvis aktivert
+            let stockRetRateForYear, bondRetRateForYear;
+            if (useSimulated && (i - 1) < activeSimulatedReturns.stockReturns.length) {
+                stockRetRateForYear = activeSimulatedReturns.stockReturns[i - 1] / 100;
+                bondRetRateForYear = activeSimulatedReturns.bondReturns[i - 1] / 100;
+            } else {
+                stockRetRateForYear = state.stockReturnRate / 100;
+                bondRetRateForYear = state.bondReturnRate / 100;
+            }
+           
             // Calculate returns individually for each portfolio based on their values at start of year
             const p1StockPct = state.row1StockAllocation || 0;
             const p2StockPct = state.row2StockAllocation || 0;
@@ -1897,17 +1997,17 @@ return () => document.removeEventListener('keydown', onKey);
             // Portfolio 1 returns (based on value at start of year)
             const p1StockValue = portfolio1Val * (p1StockPct / 100);
             const p1BondValue = portfolio1Val * ((100 - p1StockPct) / 100);
-            const p1StockReturn = p1StockValue * (stockRetRate - kpi - fee);
-            const p1BondReturn = p1BondValue * (bondRetRate - kpi - fee);
+            const p1StockReturn = p1StockValue * (stockRetRateForYear - kpi - fee);
+            const p1BondReturn = p1BondValue * (bondRetRateForYear - kpi - fee);
            
             // Portfolio 2 returns
             const p2StockValue = portfolio2Val * (p2StockPct / 100);
             const p2BondValue = portfolio2Val * ((100 - p2StockPct) / 100);
-            const p2StockReturn = p2StockValue * (stockRetRate - kpi - fee);
-            const p2BondReturn = p2BondValue * (bondRetRate - kpi - fee);
+            const p2StockReturn = p2StockValue * (stockRetRateForYear - kpi - fee);
+            const p2BondReturn = p2BondValue * (bondRetRateForYear - kpi - fee);
            
             // Portfolio 3 returns (Likviditetsfond - always bonds)
-            const p3BondReturn = portfolio3Val * (bondRetRate - kpi - fee);
+            const p3BondReturn = portfolio3Val * (bondRetRateForYear - kpi - fee);
            
             // Sum up returns
             aksjeAvkastningAnnual[i] = Math.round(p1StockReturn + p2StockReturn);
@@ -2016,7 +2116,7 @@ return () => document.removeEventListener('keydown', onKey);
             stockReturnSeries: stockReturn,
             bondReturnSeries: bondReturn,
         };
-    }, [startValuesAllYears.length, stockPctAllYears, prognosis.data.sparing, prognosis.data.event_total, prognosis.data.nettoUtbetaling, startOfYearStockValues, startOfYearBondValues, state.stockReturnRate, state.bondReturnRate, state.initialPortfolioSize]);
+    }, [startValuesAllYears.length, stockPctAllYears, prognosis.data.sparing, prognosis.data.event_total, prognosis.data.nettoUtbetaling, startOfYearStockValues, startOfYearBondValues, state.stockReturnRate, state.bondReturnRate, state.initialPortfolioSize, simButtonActive, activeSimulatedReturns]);
 
     const stackedAllYearsData = useMemo(() => ({
         labels: labelsAllYears,
@@ -2254,22 +2354,38 @@ return () => document.removeEventListener('keydown', onKey);
 
                 <div className="relative">
                     <div className="bg-white border border-[#DDDDDD] rounded-xl p-6 flex flex-col overflow-hidden w-full">
-                        <h1 className="typo-h1 text-center text-[#4A6D8C] mb-4">Mål og behov</h1>
-                        <div className="relative h-[500px]" style={{ paddingRight: '0.5rem' }}>
-                            <button
-                                onClick={() => setShowDisclaimer(true)}
-                                className="absolute -top-12 left-2 z-10 text-xs px-2 py-1 rounded-md border border-[#4A6D8C] bg-white text-[#4A6D8C] hover:bg-gray-100"
-                                title="Disclaimer/forutsetninger"
-                            >
-                                Disclaimer/forutsetninger
-                            </button>
-                            <Bar options={chartOptions} data={investmentChartData} />
-                        </div>
-                        <CustomLegend items={state.taxCalculationEnabled ? LEGEND_DATA : LEGEND_DATA.filter(i => !['Skatt på hendelser','Løpende renteskatt'].includes(i.label))} />
+                    <h1 className="typo-h1 text-center text-[#4A6D8C] mb-4">Mål og behov</h1>
+                    <div className="relative h-[500px]" style={{ paddingRight: '0.5rem' }}>
+                        <button
+                            onClick={() => setShowDisclaimer(true)}
+                            className="absolute -top-12 left-2 z-10 text-xs px-2 py-1 rounded-md border border-[#4A6D8C] bg-white text-[#4A6D8C] hover:bg-gray-100"
+                            title="Disclaimer/forutsetninger"
+                        >
+                            Disclaimer/forutsetninger
+                        </button>
+                        <Bar options={chartOptions} data={investmentChartData} />
+                    </div>
+                    <CustomLegend items={state.taxCalculationEnabled ? LEGEND_DATA : LEGEND_DATA.filter(i => !['Skatt på hendelser','Løpende renteskatt'].includes(i.label))} />
                     </div>
                     
                     {/* Tre knapper til høyre - utenfor rammen */}
                     <div className="absolute right-0 top-1/2 -translate-y-1/2 flex flex-col gap-2 items-center" style={{ transform: 'translateX(calc(100% + 1rem)) translateY(-50%)' }}>
+                        {/* Sim */}
+                        <button
+                            type="button"
+                            onClick={() => {
+                                const newActive = !simButtonActive;
+                                setSimButtonActive(newActive);
+                                // Regenerer simulering når knappen aktiveres (blir grønn)
+                                if (newActive) {
+                                    setSimulationKey(prev => prev + 1);
+                                }
+                            }}
+                            className={`${simButtonActive ? 'bg-[#66CC99] text-white' : 'bg-white border border-[#DDDDDD] text-[#333333]'} shadow-lg h-10 w-10 rounded-lg flex items-center justify-center cursor-pointer hover:opacity-90 transition-opacity relative`}
+                        >
+                            <span className={`text-sm font-bold ${!simButtonActive ? 'line-through opacity-70' : ''}`}>sim</span>
+                        </button>
+                        
                         {/* Målsøk sparing */}
                         <button
                             type="button"
@@ -2359,7 +2475,7 @@ return () => document.removeEventListener('keydown', onKey);
                 </div>
 
                 {/* Målsøk seksjon - utenfor den ytre rammen */}
-                <div className="relative" style={{ marginTop: '0.89175rem' }}>
+                <div className="relative" style={{ marginTop: '0.445875rem' }}>
                     <EyeToggle visible={showGoalSeek} onToggle={() => setShowGoalSeek(v => !v)} title="Skjul/vis Målsøk" />
                     {showGoalSeek && (
                         <div className="bg-white border border-[#DDDDDD] rounded-lg" style={{ paddingTop: '1.5rem', paddingRight: '1rem', paddingBottom: '1rem', paddingLeft: '1.5rem' }}>
@@ -2430,6 +2546,19 @@ return () => document.removeEventListener('keydown', onKey);
                             {formatCurrency(state.goalSeekPortfolio1Result || 0)}
                         </span>
                     </div>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            // Vis kun modalen hvis det finnes en simulering
+                            if (savedSimulatedReturns.stockReturns.length > 0) {
+                                setShowSimulation(true);
+                            }
+                        }}
+                        className="bg-[#999999] border border-[#DDDDDD] text-white hover:bg-[#888888] h-16 rounded-lg flex items-center justify-center text-center p-1 text-sm font-medium transition-all hover:-translate-y-0.5 shadow-md flex-shrink-0"
+                        style={{ width: '112px', height: '64px', flex: '0 0 auto' }}
+                    >
+                        Simulering<br />Avkastning
+                    </button>
                     </div>
                     {/* Fallback for mindre skjermer: plasser slider under */}
                     <div className="xl:hidden mt-2">
@@ -2725,7 +2854,94 @@ Alle uttak fra et as vil i modellen ansees som et utbytte. Om det er innskutt ka
                         </div>
                     </div>
                 )}
-               
+
+                {/* Simulering modal */}
+                {showSimulation && (
+                    <div
+                        className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
+                        onClick={() => setShowSimulation(false)}
+                    >
+                        <div
+                            className="bg-white rounded-xl shadow-2xl max-w-[1200px] w-full p-10 relative max-h-[90vh] overflow-auto"
+                            onClick={(e) => e.stopPropagation()}
+                        >
+                            <button
+                                aria-label="Lukk"
+                                onClick={() => setShowSimulation(false)}
+                                className="absolute top-3 right-3 text-[#333333]/70 hover:text-[#333333]"
+                            >
+                                ✕
+                            </button>
+                            <h3 className="typo-h3 text-[#4A6D8C] mb-6 text-[2rem]">Simulering</h3>
+                            <div className="chart-container">
+                                <Bar 
+                                    data={{
+                                        labels: Array.from({ length: (state.investmentYears || 0) + (state.payoutYears || 0) }, (_, i) => START_YEAR + i),
+                                        datasets: [
+                                            {
+                                                label: 'Aksjer (Std.avv 12%)',
+                                                data: savedSimulatedReturns.stockReturns,
+                                                backgroundColor: savedSimulatedReturns.stockReturns.map(value => value < 0 ? '#B14444' : '#4A6D8C'),
+                                                borderRadius: 4,
+                                                borderSkipped: false
+                                            },
+                                            {
+                                                label: 'Renter (Std.avv 3%)',
+                                                data: savedSimulatedReturns.bondReturns,
+                                                backgroundColor: savedSimulatedReturns.bondReturns.map(value => value < 0 ? '#E06B6B' : CHART_COLORS.avkastning),
+                                                borderRadius: 4,
+                                                borderSkipped: false
+                                            }
+                                        ]
+                                    }}
+                                    options={{
+                                        ...chartOptions,
+                                        plugins: {
+                                            ...chartOptions.plugins,
+                                            tooltip: {
+                                                ...chartOptions.plugins.tooltip,
+                                                callbacks: {
+                                                    title: (items) => `${items[0].label}`,
+                                                    label: (context) => `${context.dataset.label}: ${context.raw.toFixed(2)}%`,
+                                                }
+                                            },
+                                            legend: {
+                                                display: true,
+                                                labels: {
+                                                    color: '#333333',
+                                                    font: {
+                                                        size: 13,
+                                                        weight: '500'
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        scales: {
+                                            ...chartOptions.scales,
+                                            x: {
+                                                ...chartOptions.scales.x,
+                                                stacked: false,
+                                                ticks: {
+                                                    ...chartOptions.scales.x.ticks,
+                                                    maxRotation: 45,
+                                                    minRotation: 45
+                                                }
+                                            },
+                                            y: {
+                                                ...chartOptions.scales.y,
+                                                stacked: false,
+                                                ticks: {
+                                                    ...chartOptions.scales.y.ticks,
+                                                    callback: (value) => `${value.toFixed(1)}%`
+                                                }
+                                            }
+                                        }
+                                    }}
+                                />
+                            </div>
+                        </div>
+                    </div>
+                )}
 
                 <div className="relative">
                     <EyeToggle visible={showInvestedCapitalGraphic} onToggle={() => setShowInvestedCapitalGraphic(v => !v)} />

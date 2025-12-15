@@ -228,6 +228,9 @@ const INITIAL_APP_STATE = {
     row1StockAllocation: 0,
     row2StockAllocation: 0,
     row3StockAllocation: 0,
+    // Standardavvik for Monte Carlo simulering
+    stockStdDev: 12.0, // Standardavvik aksjer (%)
+    bondStdDev: 3.0, // Standardavvik renter (%)
 };
 
 const STOCK_ALLOCATION_OPTIONS = [
@@ -1032,6 +1035,11 @@ const [showInputModal, setShowInputModal] = useState(false);
 const [inputText, setInputText] = useState('');
     const [showAssumptionsGraphic, setShowAssumptionsGraphic] = useState(false);
     const [showSimulation, setShowSimulation] = useState(false);
+    const [showAccumulatedReturn, setShowAccumulatedReturn] = useState(false);
+    const [showMonteCarlo, setShowMonteCarlo] = useState(false);
+    const [monteCarloKey, setMonteCarloKey] = useState(0); // Brukes for å tvinge regenerering av Monte Carlo simulering
+    const [showMonteCarloPortfolio, setShowMonteCarloPortfolio] = useState(false);
+    const [monteCarloPortfolioKey, setMonteCarloPortfolioKey] = useState(0); // Brukes for å tvinge regenerering av Monte Carlo Portefølje simulering
     const [simButtonActive, setSimButtonActive] = useState(false);
     const [simulationKey, setSimulationKey] = useState(0); // Brukes for å tvinge regenerering av simulering
     const [savedSimulatedReturns, setSavedSimulatedReturns] = useState({ stockReturns: [], bondReturns: [] }); // Lagrer simulerte verdier
@@ -1166,8 +1174,8 @@ const [inputText, setInputText] = useState('');
         
         const stockReturns = [];
         const bondReturns = [];
-        const stockStdDev = 12; // 12% standardavvik for aksjer
-        const bondStdDev = 3; // 3% standardavvik for renter
+        const stockStdDev = state.stockStdDev || 12.0; // Standardavvik for aksjer fra state
+        const bondStdDev = state.bondStdDev || 3.0; // Standardavvik for renter fra state
         const stockMean = state.stockReturnRate || 8.0; // Forventet avkastning aksjer
         const bondMean = state.bondReturnRate || 5.0; // Forventet avkastning renter
         
@@ -1196,6 +1204,631 @@ const [inputText, setInputText] = useState('');
     const activeSimulatedReturns = simButtonActive && savedSimulatedReturns.stockReturns.length > 0 
         ? savedSimulatedReturns 
         : simulatedReturns;
+    
+    // Monte Carlo simulering: Beregn maksimal utbetaling gitt en simulert avkastningsserie
+    const calculateMaxPayout = useCallback((stockReturns, bondReturns, state) => {
+        const totalYears = state.investmentYears + state.payoutYears;
+        if (totalYears === 0) return 0;
+        
+        const annualStockPercentages = populateAnnualStockPercentages(state);
+        let portfolioValue = state.initialPortfolioSize + (state.pensionPortfolioSize || 0) + (state.additionalPensionAmount || 0);
+        
+        // Simuler porteføljevekst gjennom alle årene
+        const portfolioValues = [portfolioValue];
+        
+        for (let i = 0; i < totalYears; i++) {
+            const isInvestmentYear = i < state.investmentYears;
+            const stockPct = annualStockPercentages[i] / 100;
+            const bondPct = 1 - stockPct;
+            
+            // Legg til sparing i investeringsårene
+            if (isInvestmentYear && state.annualSavings > 0) {
+                portfolioValue += state.annualSavings;
+            }
+            
+            // Beregn avkastning
+            const stockReturn = stockReturns[i] / 100;
+            const bondReturn = bondReturns[i] / 100;
+            const portfolioReturn = (stockPct * stockReturn) + (bondPct * bondReturn);
+            
+            portfolioValue *= (1 + portfolioReturn);
+            portfolioValues.push(portfolioValue);
+        }
+        
+        // Finn maksimal konstant årlig utbetaling som gjør at porteføljen går i null siste år
+        // Bruk binærsøk for å finne maksimal utbetaling
+        const initialValue = state.initialPortfolioSize + (state.pensionPortfolioSize || 0) + (state.additionalPensionAmount || 0);
+        let low = 0;
+        let high = initialValue * 2; // Start med høy verdi
+        let maxPayout = 0;
+        const tolerance = 100; // Toleranse i kroner
+        
+        while (high - low > tolerance) {
+            const testPayout = (low + high) / 2;
+            let testValue = initialValue;
+            
+            // Simuler med test utbetaling
+            for (let i = 0; i < totalYears; i++) {
+                const isInvestmentYear = i < state.investmentYears;
+                const stockPct = annualStockPercentages[i] / 100;
+                const bondPct = 1 - stockPct;
+                
+                // Legg til sparing i investeringsårene
+                if (isInvestmentYear && state.annualSavings > 0) {
+                    testValue += state.annualSavings;
+                }
+                
+                // Beregn avkastning
+                const stockReturn = stockReturns[i] / 100;
+                const bondReturn = bondReturns[i] / 100;
+                const portfolioReturn = (stockPct * stockReturn) + (bondPct * bondReturn);
+                
+                testValue *= (1 + portfolioReturn);
+                
+                // Trekk fra utbetaling i utbetalingsårene
+                if (!isInvestmentYear) {
+                    testValue -= testPayout;
+                    if (testValue < 0) break;
+                }
+            }
+            
+            if (testValue < 0) {
+                // Porteføljen går i null for tidlig, reduser utbetaling
+                high = testPayout;
+            } else if (testValue <= tolerance) {
+                // Porteføljen går i null eller er veldig nær null siste år - perfekt!
+                maxPayout = testPayout;
+                low = testPayout;
+            } else {
+                // Porteføljen har fortsatt verdi, kan øke utbetaling
+                maxPayout = testPayout; // Oppdater maksimal utbetaling
+                low = testPayout;
+            }
+        }
+        
+        // Beregn total sum av utbetalinger
+        const payoutYears = state.payoutYears;
+        return maxPayout * payoutYears;
+    }, []);
+    
+    // Monte Carlo Portefølje simulering: Beregn porteføljens verdi ved slutten av investeringsperioden
+    const calculatePortfolioValue = useCallback((stockReturns, bondReturns, state) => {
+        if (state.investmentYears === 0) {
+            return state.initialPortfolioSize + (state.pensionPortfolioSize || 0) + (state.additionalPensionAmount || 0);
+        }
+        
+        const annualStockPercentages = populateAnnualStockPercentages(state);
+        let portfolioValue = state.initialPortfolioSize + (state.pensionPortfolioSize || 0) + (state.additionalPensionAmount || 0);
+        
+        // Simuler porteføljevekst gjennom investeringsperioden
+        for (let i = 0; i < state.investmentYears; i++) {
+            const stockPct = annualStockPercentages[i] / 100;
+            const bondPct = 1 - stockPct;
+            
+            // Legg til sparing i investeringsårene
+            if (state.annualSavings > 0) {
+                portfolioValue += state.annualSavings;
+            }
+            
+            // Beregn avkastning
+            const stockReturn = stockReturns[i] / 100;
+            const bondReturn = bondReturns[i] / 100;
+            const portfolioReturn = (stockPct * stockReturn) + (bondPct * bondReturn);
+            
+            portfolioValue *= (1 + portfolioReturn);
+        }
+        
+        return portfolioValue;
+    }, []);
+    
+    // Monte Carlo simulering: Gjør 10 simuleringer
+    const monteCarloResults = useMemo(() => {
+        // Hvis monteCarloKey er 0, returner tom array (ingen simulering gjort ennå)
+        if (monteCarloKey === 0) return [];
+        
+        const totalYears = state.investmentYears + state.payoutYears;
+        if (totalYears === 0 || state.payoutYears === 0) return [];
+        
+        const stockStdDev = state.stockStdDev || 12.0; // Standardavvik for aksjer fra state
+        const bondStdDev = state.bondStdDev || 3.0; // Standardavvik for renter fra state
+        const stockMean = state.stockReturnRate || 8.0;
+        const bondMean = state.bondReturnRate || 5.0;
+        
+        const results = [];
+        
+        for (let sim = 0; sim < 1000; sim++) {
+            // Generer tilfeldig avkastning for alle årene
+            const stockReturns = [];
+            const bondReturns = [];
+            
+            for (let i = 0; i < totalYears; i++) {
+                const simulatedStockReturn = generateNormalRandom(stockMean, stockStdDev);
+                const simulatedBondReturn = generateNormalRandom(bondMean, bondStdDev);
+                stockReturns.push(simulatedStockReturn);
+                bondReturns.push(simulatedBondReturn);
+            }
+            
+            // Beregn maksimal utbetaling for denne simuleringen
+            const totalPayout = calculateMaxPayout(stockReturns, bondReturns, state);
+            results.push(totalPayout);
+        }
+        
+        return results.sort((a, b) => a - b); // Sorter for å lage normalfordeling
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [monteCarloKey, state.stockStdDev, state.bondStdDev, state.stockReturnRate, state.bondReturnRate, state.investmentYears, state.payoutYears]); // Regenerer når standardavvik eller andre relevante verdier endres
+    
+    // Beregn normalfordelingsdata for grafikken
+    const monteCarloChartData = useMemo(() => {
+        if (monteCarloResults.length === 0) return null;
+        
+        const mean = monteCarloResults.reduce((a, b) => a + b, 0) / monteCarloResults.length;
+        const variance = monteCarloResults.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / monteCarloResults.length;
+        const stdDev = Math.sqrt(variance);
+        
+        // Beregn x-aksen basert på mean ± 2 standardavvik for å alltid vise to standardavvik
+        // Sikre at range er minimum gjennomsnittet ± 2 standardavvik
+        const meanPlus2StdDev = mean + (2 * stdDev);
+        const meanMinus2StdDev = mean - (2 * stdDev);
+        
+        // Finn faktisk min og max fra simuleringene
+        const actualMin = Math.min(...monteCarloResults);
+        const actualMax = Math.max(...monteCarloResults);
+        
+        // Bruk den største av faktisk range eller mean ± 2 stdDev
+        const requiredMin = Math.min(meanMinus2StdDev, actualMin);
+        const requiredMax = Math.max(meanPlus2StdDev, actualMax);
+        
+        // Legg til litt padding (10% på hver side) for bedre visuell presentasjon
+        const padding = (requiredMax - requiredMin) * 0.1;
+        const range = (requiredMax - requiredMin) + (2 * padding);
+        const numPoints = 200;
+        const step = range / numPoints;
+        const startX = requiredMin - padding;
+        
+        const labels = [];
+        const normalCurve = [];
+        const histogram = new Array(numPoints).fill(0);
+        
+        // Beregn normalfordelingskurve
+        for (let i = 0; i < numPoints; i++) {
+            const x = startX + i * step;
+            // Formater til millioner med komma (f.eks. "1,2 M")
+            if (x >= 1000000) {
+                labels.push(`${(x / 1000000).toFixed(1).replace('.', ',')} M`);
+            } else if (x >= 1000) {
+                labels.push(`${(x / 1000).toFixed(1).replace('.', ',')} k`);
+            } else {
+                labels.push(Math.round(x).toString());
+            }
+            
+            // Normalfordelingsformel
+            if (stdDev > 0) {
+                const exponent = -0.5 * Math.pow((x - mean) / stdDev, 2);
+                const density = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponent);
+                // Skaler for å matche histogrammet visuelt (antall simuleringer)
+                // Multipliser med antall simuleringer og bin-bredde for å konvertere sannsynlighetstetthet til antall
+                const binWidth = step;
+                // Skaleringsfaktor for å få kurven til å matche histogrammet visuelt
+                normalCurve.push(density * monteCarloResults.length * binWidth * 50);
+            } else {
+                normalCurve.push(0);
+            }
+        }
+        
+        // Lag histogram
+        monteCarloResults.forEach(val => {
+            const index = Math.min(Math.floor(((val - startX) / range) * numPoints), numPoints - 1);
+            if (index >= 0 && index < numPoints) {
+                histogram[index]++;
+            }
+        });
+        
+        // Lag vertikal linje for gjennomsnittet som starter fra x-aksen (y=0) og går oppover
+        // Bruker en bar chart med en veldig smal bar for å få en vertikal linje
+        const meanLineIndex = Math.round(((mean - startX) / range) * numPoints);
+        const meanLine = new Array(numPoints).fill(0);
+        // Beregn maksverdien for gjennomsnittslinjen
+        const maxNormalCurveValueForMeanLine = normalCurve.length > 0 ? Math.max(...normalCurve) : 0;
+        if (meanLineIndex >= 0 && meanLineIndex < numPoints && maxNormalCurveValueForMeanLine > 0) {
+            // Sett verdien på gjennomsnittet til maksverdien, starter fra 0 (x-aksen)
+            meanLine[meanLineIndex] = maxNormalCurveValueForMeanLine;
+        }
+        
+        // Lag vertikale linjer for gjennomsnitt ± ett standardavvik
+        const meanPlusStdDev = mean + stdDev;
+        const meanMinusStdDev = mean - stdDev;
+        const meanPlusStdDevIndex = Math.round(((meanPlusStdDev - startX) / range) * numPoints);
+        const meanMinusStdDevIndex = Math.round(((meanMinusStdDev - startX) / range) * numPoints);
+        
+        // Beregn høyden på bell-kurven ved disse x-verdiene
+        let meanPlusStdDevHeight = 0;
+        let meanMinusStdDevHeight = 0;
+        
+        if (stdDev > 0) {
+            // Beregn normalfordelingshøyde ved mean + stdDev
+            const exponentPlus = -0.5 * Math.pow((meanPlusStdDev - mean) / stdDev, 2);
+            const densityPlus = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponentPlus);
+            const binWidth = step;
+            meanPlusStdDevHeight = densityPlus * monteCarloResults.length * binWidth * 50;
+            
+            // Beregn normalfordelingshøyde ved mean - stdDev
+            const exponentMinus = -0.5 * Math.pow((meanMinusStdDev - mean) / stdDev, 2);
+            const densityMinus = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponentMinus);
+            meanMinusStdDevHeight = densityMinus * monteCarloResults.length * binWidth * 50;
+        }
+        
+        const meanPlusStdDevLine = new Array(numPoints).fill(0);
+        const meanMinusStdDevLine = new Array(numPoints).fill(0);
+        
+        if (meanPlusStdDevIndex >= 0 && meanPlusStdDevIndex < numPoints && meanPlusStdDevHeight > 0) {
+            meanPlusStdDevLine[meanPlusStdDevIndex] = meanPlusStdDevHeight;
+        }
+        if (meanMinusStdDevIndex >= 0 && meanMinusStdDevIndex < numPoints && meanMinusStdDevHeight > 0) {
+            meanMinusStdDevLine[meanMinusStdDevIndex] = meanMinusStdDevHeight;
+        }
+        
+        // Lag vertikale linjer for gjennomsnitt ± to standardavvik
+        const meanPlus2StdDevCalc = mean + (2 * stdDev);
+        const meanMinus2StdDevCalc = mean - (2 * stdDev);
+        const meanPlus2StdDevIndex = Math.round(((meanPlus2StdDevCalc - startX) / range) * numPoints);
+        const meanMinus2StdDevIndex = Math.round(((meanMinus2StdDevCalc - startX) / range) * numPoints);
+        
+        // Beregn høyden på bell-kurven ved disse x-verdiene
+        let meanPlus2StdDevHeight = 0;
+        let meanMinus2StdDevHeight = 0;
+        
+        if (stdDev > 0) {
+            // Beregn normalfordelingshøyde ved mean + 2*stdDev
+            const exponentPlus2 = -0.5 * Math.pow((meanPlus2StdDevCalc - mean) / stdDev, 2);
+            const densityPlus2 = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponentPlus2);
+            const binWidth2 = step;
+            meanPlus2StdDevHeight = densityPlus2 * monteCarloResults.length * binWidth2 * 50;
+            
+            // Beregn normalfordelingshøyde ved mean - 2*stdDev
+            const exponentMinus2 = -0.5 * Math.pow((meanMinus2StdDevCalc - mean) / stdDev, 2);
+            const densityMinus2 = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponentMinus2);
+            meanMinus2StdDevHeight = densityMinus2 * monteCarloResults.length * binWidth2 * 50;
+        }
+        
+        const meanPlus2StdDevLine = new Array(numPoints).fill(0);
+        const meanMinus2StdDevLine = new Array(numPoints).fill(0);
+        
+        if (meanPlus2StdDevIndex >= 0 && meanPlus2StdDevIndex < numPoints && meanPlus2StdDevHeight > 0) {
+            meanPlus2StdDevLine[meanPlus2StdDevIndex] = meanPlus2StdDevHeight;
+        }
+        if (meanMinus2StdDevIndex >= 0 && meanMinus2StdDevIndex < numPoints && meanMinus2StdDevHeight > 0) {
+            meanMinus2StdDevLine[meanMinus2StdDevIndex] = meanMinus2StdDevHeight;
+        }
+        
+        // Finn maksverdien av normalfordelingskurven
+        const maxNormalCurveValue = normalCurve.length > 0 ? Math.max(...normalCurve) : 0;
+        
+        // Beregn frekvenstabell: 10 linjer basert på gjennomsnittet ± 2 standardavvik
+        let frequencyTable = [];
+        
+        if (isNaN(mean) || isNaN(stdDev) || stdDev <= 0 || !isFinite(mean) || !isFinite(stdDev)) {
+            // Hvis mean eller stdDev ikke er gyldig, returner tom tabell
+            frequencyTable = [];
+        } else {
+            const numBins = 10; // 10 linjer i tabellen
+            const meanMinus2StdDev = mean - (2 * stdDev);
+            const meanPlus2StdDev = mean + (2 * stdDev);
+            const totalRange = meanPlus2StdDev - meanMinus2StdDev;
+            const binWidth = totalRange / numBins;
+            
+            // Opprett 10 intervaller
+            const bins = [];
+            for (let i = 0; i < numBins; i++) {
+                const binStart = meanMinus2StdDev + (i * binWidth);
+                const binEnd = meanMinus2StdDev + ((i + 1) * binWidth);
+                const binCenter = binStart + (binWidth / 2);
+                bins.push({
+                    start: binStart,
+                    end: binEnd,
+                    center: binCenter,
+                    count: 0
+                });
+            }
+            
+            // Tell simuleringer i hvert intervall
+            monteCarloResults.forEach(val => {
+                // Finn hvilket intervall verdien tilhører
+                for (let i = 0; i < bins.length; i++) {
+                    const bin = bins[i];
+                    // Siste intervall inkluderer også endepunktet
+                    if (i === bins.length - 1) {
+                        if (val >= bin.start && val <= bin.end) {
+                            bin.count++;
+                            break;
+                        }
+                    } else {
+                        if (val >= bin.start && val < bin.end) {
+                            bin.count++;
+                            break;
+                        }
+                    }
+                }
+            });
+            
+            // Konverter til frequencyTable format
+            frequencyTable = bins.map(bin => ({
+                value: bin.center,
+                count: bin.count
+            }));
+            
+            // Sorter slik at høyeste er øverst
+            frequencyTable.sort((a, b) => b.value - a.value);
+        }
+        
+        return {
+            labels,
+            normalCurve,
+            histogram,
+            meanLine,
+            meanPlusStdDevLine,
+            meanMinusStdDevLine,
+            meanPlus2StdDevLine,
+            meanMinus2StdDevLine,
+            mean,
+            stdDev,
+            maxNormalCurveValue,
+            frequencyTable
+        };
+    }, [monteCarloResults]);
+    
+    // Monte Carlo Portefølje simulering: Beregn porteføljens verdi ved slutten av investeringsperioden
+    const monteCarloPortfolioResults = useMemo(() => {
+        // Hvis monteCarloPortfolioKey er 0, returner tom array (ingen simulering gjort ennå)
+        if (monteCarloPortfolioKey === 0) return [];
+        
+        if (state.investmentYears === 0) return [];
+        
+        const stockStdDev = state.stockStdDev || 12.0; // Standardavvik for aksjer fra state
+        const bondStdDev = state.bondStdDev || 3.0; // Standardavvik for renter fra state
+        const stockMean = state.stockReturnRate || 8.0;
+        const bondMean = state.bondReturnRate || 5.0;
+        
+        const results = [];
+        
+        for (let sim = 0; sim < 1000; sim++) {
+            // Generer tilfeldig avkastning for investeringsperioden
+            const stockReturns = [];
+            const bondReturns = [];
+            
+            for (let i = 0; i < state.investmentYears; i++) {
+                const simulatedStockReturn = generateNormalRandom(stockMean, stockStdDev);
+                const simulatedBondReturn = generateNormalRandom(bondMean, bondStdDev);
+                stockReturns.push(simulatedStockReturn);
+                bondReturns.push(simulatedBondReturn);
+            }
+            
+            // Beregn porteføljens verdi ved slutten av investeringsperioden
+            const portfolioValue = calculatePortfolioValue(stockReturns, bondReturns, state);
+            results.push(portfolioValue);
+        }
+        
+        return results.sort((a, b) => a - b); // Sorter for å lage normalfordeling
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [monteCarloPortfolioKey, calculatePortfolioValue, state.stockStdDev, state.bondStdDev, state.stockReturnRate, state.bondReturnRate, state.investmentYears]);
+    
+    // Beregn normalfordelingsdata for Portefølje-grafikken
+    const monteCarloPortfolioChartData = useMemo(() => {
+        if (monteCarloPortfolioResults.length === 0) return null;
+        
+        const mean = monteCarloPortfolioResults.reduce((a, b) => a + b, 0) / monteCarloPortfolioResults.length;
+        const variance = monteCarloPortfolioResults.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / monteCarloPortfolioResults.length;
+        const stdDev = Math.sqrt(variance);
+        
+        // Beregn x-aksen basert på mean ± 2 standardavvik for å alltid vise to standardavvik
+        // Sikre at range er minimum gjennomsnittet ± 2 standardavvik
+        const meanPlus2StdDev = mean + (2 * stdDev);
+        const meanMinus2StdDev = mean - (2 * stdDev);
+        
+        // Finn faktisk min og max fra simuleringene
+        const actualMin = Math.min(...monteCarloPortfolioResults);
+        const actualMax = Math.max(...monteCarloPortfolioResults);
+        
+        // Bruk den største av faktisk range eller mean ± 2 stdDev
+        const requiredMin = Math.min(meanMinus2StdDev, actualMin);
+        const requiredMax = Math.max(meanPlus2StdDev, actualMax);
+        
+        // Legg til litt padding (10% på hver side) for bedre visuell presentasjon
+        const padding = (requiredMax - requiredMin) * 0.1;
+        const range = (requiredMax - requiredMin) + (2 * padding);
+        const numPoints = 200;
+        const step = range / numPoints;
+        const startX = requiredMin - padding;
+        
+        const labels = [];
+        const normalCurve = [];
+        const histogram = new Array(numPoints).fill(0);
+        
+        // Beregn normalfordelingskurve
+        for (let i = 0; i < numPoints; i++) {
+            const x = startX + i * step;
+            // Formater til millioner med komma (f.eks. "1,2 M")
+            if (x >= 1000000) {
+                labels.push(`${(x / 1000000).toFixed(1).replace('.', ',')} M`);
+            } else if (x >= 1000) {
+                labels.push(`${(x / 1000).toFixed(1).replace('.', ',')} k`);
+            } else {
+                labels.push(Math.round(x).toString());
+            }
+            
+            // Normalfordelingsformel
+            if (stdDev > 0) {
+                const exponent = -0.5 * Math.pow((x - mean) / stdDev, 2);
+                const density = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponent);
+                // Skaler for å matche histogrammet visuelt (antall simuleringer)
+                // Multipliser med antall simuleringer og bin-bredde for å konvertere sannsynlighetstetthet til antall
+                const binWidth = step;
+                // Skaleringsfaktor for å få kurven til å matche histogrammet visuelt
+                normalCurve.push(density * monteCarloPortfolioResults.length * binWidth * 50);
+            } else {
+                normalCurve.push(0);
+            }
+        }
+        
+        // Lag histogram
+        monteCarloPortfolioResults.forEach(val => {
+            const index = Math.min(Math.floor(((val - startX) / range) * numPoints), numPoints - 1);
+            if (index >= 0 && index < numPoints) {
+                histogram[index]++;
+            }
+        });
+        
+        // Lag vertikal linje for gjennomsnittet som starter fra x-aksen (y=0) og går oppover
+        // Bruker en bar chart med en veldig smal bar for å få en vertikal linje
+        const meanLineIndex = Math.round(((mean - startX) / range) * numPoints);
+        const meanLine = new Array(numPoints).fill(0);
+        // Beregn maksverdien for gjennomsnittslinjen
+        const maxNormalCurveValueForMeanLine = normalCurve.length > 0 ? Math.max(...normalCurve) : 0;
+        if (meanLineIndex >= 0 && meanLineIndex < numPoints && maxNormalCurveValueForMeanLine > 0) {
+            // Sett verdien på gjennomsnittet til maksverdien, starter fra 0 (x-aksen)
+            meanLine[meanLineIndex] = maxNormalCurveValueForMeanLine;
+        }
+        
+        // Lag vertikale linjer for gjennomsnitt ± ett standardavvik
+        const meanPlusStdDev = mean + stdDev;
+        const meanMinusStdDev = mean - stdDev;
+        const meanPlusStdDevIndex = Math.round(((meanPlusStdDev - startX) / range) * numPoints);
+        const meanMinusStdDevIndex = Math.round(((meanMinusStdDev - startX) / range) * numPoints);
+        
+        // Beregn høyden på bell-kurven ved disse x-verdiene
+        let meanPlusStdDevHeight = 0;
+        let meanMinusStdDevHeight = 0;
+        
+        if (stdDev > 0) {
+            // Beregn normalfordelingshøyde ved mean + stdDev
+            const exponentPlus = -0.5 * Math.pow((meanPlusStdDev - mean) / stdDev, 2);
+            const densityPlus = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponentPlus);
+            const binWidth = step;
+            meanPlusStdDevHeight = densityPlus * monteCarloPortfolioResults.length * binWidth * 50;
+            
+            // Beregn normalfordelingshøyde ved mean - stdDev
+            const exponentMinus = -0.5 * Math.pow((meanMinusStdDev - mean) / stdDev, 2);
+            const densityMinus = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponentMinus);
+            meanMinusStdDevHeight = densityMinus * monteCarloPortfolioResults.length * binWidth * 50;
+        }
+        
+        const meanPlusStdDevLine = new Array(numPoints).fill(0);
+        const meanMinusStdDevLine = new Array(numPoints).fill(0);
+        
+        if (meanPlusStdDevIndex >= 0 && meanPlusStdDevIndex < numPoints && meanPlusStdDevHeight > 0) {
+            meanPlusStdDevLine[meanPlusStdDevIndex] = meanPlusStdDevHeight;
+        }
+        if (meanMinusStdDevIndex >= 0 && meanMinusStdDevIndex < numPoints && meanMinusStdDevHeight > 0) {
+            meanMinusStdDevLine[meanMinusStdDevIndex] = meanMinusStdDevHeight;
+        }
+        
+        // Lag vertikale linjer for gjennomsnitt ± to standardavvik
+        const meanPlus2StdDevCalc = mean + (2 * stdDev);
+        const meanMinus2StdDevCalc = mean - (2 * stdDev);
+        const meanPlus2StdDevIndex = Math.round(((meanPlus2StdDevCalc - startX) / range) * numPoints);
+        const meanMinus2StdDevIndex = Math.round(((meanMinus2StdDevCalc - startX) / range) * numPoints);
+        
+        // Beregn høyden på bell-kurven ved disse x-verdiene
+        let meanPlus2StdDevHeight = 0;
+        let meanMinus2StdDevHeight = 0;
+        
+        if (stdDev > 0) {
+            // Beregn normalfordelingshøyde ved mean + 2*stdDev
+            const exponentPlus2 = -0.5 * Math.pow((meanPlus2StdDevCalc - mean) / stdDev, 2);
+            const densityPlus2 = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponentPlus2);
+            const binWidth2 = step;
+            meanPlus2StdDevHeight = densityPlus2 * monteCarloPortfolioResults.length * binWidth2 * 50;
+            
+            // Beregn normalfordelingshøyde ved mean - 2*stdDev
+            const exponentMinus2 = -0.5 * Math.pow((meanMinus2StdDevCalc - mean) / stdDev, 2);
+            const densityMinus2 = (1 / (stdDev * Math.sqrt(2 * Math.PI))) * Math.exp(exponentMinus2);
+            meanMinus2StdDevHeight = densityMinus2 * monteCarloPortfolioResults.length * binWidth2 * 50;
+        }
+        
+        const meanPlus2StdDevLine = new Array(numPoints).fill(0);
+        const meanMinus2StdDevLine = new Array(numPoints).fill(0);
+        
+        if (meanPlus2StdDevIndex >= 0 && meanPlus2StdDevIndex < numPoints && meanPlus2StdDevHeight > 0) {
+            meanPlus2StdDevLine[meanPlus2StdDevIndex] = meanPlus2StdDevHeight;
+        }
+        if (meanMinus2StdDevIndex >= 0 && meanMinus2StdDevIndex < numPoints && meanMinus2StdDevHeight > 0) {
+            meanMinus2StdDevLine[meanMinus2StdDevIndex] = meanMinus2StdDevHeight;
+        }
+        
+        // Finn maksverdien av normalfordelingskurven
+        const maxNormalCurveValue = normalCurve.length > 0 ? Math.max(...normalCurve) : 0;
+        
+        // Beregn frekvenstabell: 10 linjer basert på gjennomsnittet ± 2 standardavvik
+        let frequencyTable = [];
+        
+        if (isNaN(mean) || isNaN(stdDev) || stdDev <= 0 || !isFinite(mean) || !isFinite(stdDev)) {
+            // Hvis mean eller stdDev ikke er gyldig, returner tom tabell
+            frequencyTable = [];
+        } else {
+            const numBins = 10; // 10 linjer i tabellen
+            const meanMinus2StdDev = mean - (2 * stdDev);
+            const meanPlus2StdDev = mean + (2 * stdDev);
+            const totalRange = meanPlus2StdDev - meanMinus2StdDev;
+            const binWidth = totalRange / numBins;
+            
+            // Opprett 10 intervaller
+            const bins = [];
+            for (let i = 0; i < numBins; i++) {
+                const binStart = meanMinus2StdDev + (i * binWidth);
+                const binEnd = meanMinus2StdDev + ((i + 1) * binWidth);
+                const binCenter = binStart + (binWidth / 2);
+                bins.push({
+                    start: binStart,
+                    end: binEnd,
+                    center: binCenter,
+                    count: 0
+                });
+            }
+            
+            // Tell simuleringer i hvert intervall
+            monteCarloPortfolioResults.forEach(val => {
+                // Finn hvilket intervall verdien tilhører
+                for (let i = 0; i < bins.length; i++) {
+                    const bin = bins[i];
+                    // Siste intervall inkluderer også endepunktet
+                    if (i === bins.length - 1) {
+                        if (val >= bin.start && val <= bin.end) {
+                            bin.count++;
+                            break;
+                        }
+                    } else {
+                        if (val >= bin.start && val < bin.end) {
+                            bin.count++;
+                            break;
+                        }
+                    }
+                }
+            });
+            
+            // Konverter til frequencyTable format
+            frequencyTable = bins.map(bin => ({
+                value: bin.center,
+                count: bin.count
+            }));
+            
+            // Sorter slik at høyeste er øverst
+            frequencyTable.sort((a, b) => b.value - a.value);
+        }
+        
+        return {
+            labels,
+            normalCurve,
+            histogram,
+            meanLine,
+            meanPlusStdDevLine,
+            meanMinusStdDevLine,
+            meanPlus2StdDevLine,
+            meanMinus2StdDevLine,
+            mean,
+            stdDev,
+            maxNormalCurveValue,
+            frequencyTable
+        };
+    }, [monteCarloPortfolioResults]);
     
     const prognosis = useMemo(() => calculatePrognosis(state, simButtonActive, activeSimulatedReturns), [state, simButtonActive, activeSimulatedReturns]);
 
@@ -2118,6 +2751,61 @@ return () => document.removeEventListener('keydown', onKey);
         };
     }, [startValuesAllYears.length, stockPctAllYears, prognosis.data.sparing, prognosis.data.event_total, prognosis.data.nettoUtbetaling, startOfYearStockValues, startOfYearBondValues, state.stockReturnRate, state.bondReturnRate, state.initialPortfolioSize, simButtonActive, activeSimulatedReturns]);
 
+    // Beregn akkumulert avkastning basert på simulerte avkastninger og aksjeandel
+    const accumulatedReturnData = useMemo(() => {
+        if (!savedSimulatedReturns.stockReturns.length || !prognosis.data.annualStockPercentages.length) {
+            return { labels: [], indexValues: [], percentValues: [], krValues: [] };
+        }
+
+        const totalYears = state.investmentYears + state.payoutYears;
+        const labels = ['start', ...Array.from({ length: totalYears }, (_, i) => START_YEAR + i)];
+        const indexValues = [];
+        const percentValues = [];
+        const krValues = [];
+        let accumulatedIndex = 100; // Start med indeks 100
+
+        // Legg til startverdiene
+        indexValues.push(accumulatedIndex);
+        percentValues.push(0); // 0% ved start
+        krValues.push(0); // 0 kr ved start
+
+        for (let i = 0; i < totalYears; i++) {
+            if (i < savedSimulatedReturns.stockReturns.length && i < savedSimulatedReturns.bondReturns.length) {
+                // annualStockPercentages har "start" verdi på indeks 0, så bruk i+1 for årlige verdier
+                const stockPercentageIndex = i + 1;
+                const stockReturn = savedSimulatedReturns.stockReturns[i] / 100; // Konverter fra prosent til desimal
+                const bondReturn = savedSimulatedReturns.bondReturns[i] / 100;
+                const stockPercentage = stockPercentageIndex < prognosis.data.annualStockPercentages.length 
+                    ? (prognosis.data.annualStockPercentages[stockPercentageIndex] || 0) / 100
+                    : (prognosis.data.annualStockPercentages[prognosis.data.annualStockPercentages.length - 1] || 0) / 100;
+                const bondPercentage = 1 - stockPercentage;
+
+                // Vektet avkastning basert på aksjeandel
+                const weightedReturn = (stockReturn * stockPercentage) + (bondReturn * bondPercentage);
+                
+                // Akkumuler: multipliser med (1 + avkastning)
+                accumulatedIndex = accumulatedIndex * (1 + weightedReturn);
+            }
+            
+            // Beregn prosentvis akkumulert avkastning (fra startverdi 100)
+            const percentAccumulated = ((accumulatedIndex / 100) - 1) * 100;
+            
+            // Hent årlig avkastning i kr fra stockReturnSeries og bondReturnSeries
+            // Disse arrays starter med indeks 0 ("start"), så vi bruker i+1 for årene
+            const yearIndex = i + 1;
+            let annualReturnKr = 0;
+            if (yearIndex < stockReturnSeries.length && yearIndex < bondReturnSeries.length) {
+                annualReturnKr = (stockReturnSeries[yearIndex] || 0) + (bondReturnSeries[yearIndex] || 0);
+            }
+            
+            indexValues.push(accumulatedIndex);
+            percentValues.push(percentAccumulated);
+            krValues.push(annualReturnKr);
+        }
+
+        return { labels, indexValues, percentValues, krValues };
+    }, [savedSimulatedReturns, prognosis.data.annualStockPercentages, state.investmentYears, state.payoutYears, stockReturnSeries, bondReturnSeries]);
+
     const stackedAllYearsData = useMemo(() => ({
         labels: labelsAllYears,
         datasets: [
@@ -2479,7 +3167,16 @@ return () => document.removeEventListener('keydown', onKey);
                     <EyeToggle visible={showGoalSeek} onToggle={() => setShowGoalSeek(v => !v)} title="Skjul/vis Målsøk" />
                     {showGoalSeek && (
                         <div className="bg-white border border-[#DDDDDD] rounded-lg" style={{ paddingTop: '1.5rem', paddingRight: '1rem', paddingBottom: '1rem', paddingLeft: '1.5rem' }}>
-                            <h2 className="typo-h2 text-[#4A6D8C] mb-4">Målsøk</h2>
+                            <div className="hidden xl:flex items-center gap-3 w-full mb-4">
+                                <h2 className="typo-h2 text-[#4A6D8C] flex-shrink-0" style={{ width: '112px' }}>Målsøk</h2>
+                                <div style={{ width: '25%', flex: '0 0 auto' }}></div>
+                                <div style={{ width: '112px', flex: '0 0 auto' }}></div>
+                                <div style={{ minWidth: '98px', flex: '0 0 auto' }}></div>
+                                <div style={{ width: '112px', flex: '0 0 auto' }}></div>
+                                <div style={{ minWidth: '98px', flex: '0 0 auto' }}></div>
+                                <h2 className="typo-h2 text-[#4A6D8C] flex-shrink-0" style={{ width: '112px', marginLeft: '10px' }}>Simuleringer/grafikk</h2>
+                            </div>
+                            <h2 className="xl:hidden typo-h2 text-[#4A6D8C] mb-4">Målsøk</h2>
                     <button
                         type="button"
                         onClick={goalSeekAnnualSavings}
@@ -2554,10 +3251,47 @@ return () => document.removeEventListener('keydown', onKey);
                                 setShowSimulation(true);
                             }
                         }}
-                        className="bg-[#999999] border border-[#DDDDDD] text-white hover:bg-[#888888] h-16 rounded-lg flex items-center justify-center text-center p-1 text-sm font-medium transition-all hover:-translate-y-0.5 shadow-md flex-shrink-0"
-                        style={{ width: '112px', height: '64px', flex: '0 0 auto' }}
+                        className="bg-[#999999] border border-[#DDDDDD] text-white hover:bg-[#888888] h-16 rounded-2xl flex items-center justify-center text-center p-2 text-sm font-medium transition-all hover:-translate-y-0.5 shadow-md"
+                        style={{ flex: '1 1 0', minWidth: '0', maxWidth: '100%', marginRight: '10px' }}
                     >
-                        Simulering<br />Avkastning
+                        Simulering<br />år for år
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            // Vis kun modalen hvis det finnes en simulering
+                            if (savedSimulatedReturns.stockReturns.length > 0) {
+                                setShowAccumulatedReturn(true);
+                            }
+                        }}
+                        className="bg-[#3498DB] border border-[#DDDDDD] text-white hover:bg-[#2980B9] h-16 rounded-2xl flex items-center justify-center text-center p-2 text-sm font-medium transition-all hover:-translate-y-0.5 shadow-md"
+                        style={{ flex: '1 1 0', minWidth: '0', maxWidth: '100%', marginRight: '10px' }}
+                    >
+                        Simulering,<br />akkumulert avkastning
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            // Generer ny Monte Carlo simulering hver gang knappen klikkes
+                            setMonteCarloKey(k => k + 1);
+                            setShowMonteCarlo(true);
+                        }}
+                        className="bg-[#CCCCCC] border border-[#DDDDDD] text-white hover:bg-[#BBBBBB] h-16 rounded-2xl flex items-center justify-center text-center p-2 text-sm font-medium transition-all hover:-translate-y-0.5 shadow-md"
+                        style={{ flex: '1 1 0', minWidth: '0', maxWidth: '100%', marginRight: '10px' }}
+                    >
+                        Monte Carlo<br />Utbetalinger
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            // Generer ny Monte Carlo Portefølje simulering hver gang knappen klikkes
+                            setMonteCarloPortfolioKey(k => k + 1);
+                            setShowMonteCarloPortfolio(true);
+                        }}
+                        className="bg-[#2980B9] border border-[#DDDDDD] text-white hover:bg-[#21618C] h-16 rounded-2xl flex items-center justify-center text-center p-2 text-sm font-medium transition-all hover:-translate-y-0.5 shadow-md"
+                        style={{ flex: '1 1 0', minWidth: '0', maxWidth: '100%' }}
+                    >
+                        Monte Carlo<br />Portefølje
                     </button>
                     </div>
                     {/* Fallback for mindre skjermer: plasser slider under */}
@@ -2943,6 +3677,686 @@ Alle uttak fra et as vil i modellen ansees som et utbytte. Om det er innskutt ka
                     </div>
                 )}
 
+                {/* Akkumulert avkastning modal */}
+                {showAccumulatedReturn && (
+                    <div
+                        className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
+                        onClick={() => setShowAccumulatedReturn(false)}
+                    >
+                        <div
+                            className="bg-white rounded-xl shadow-2xl max-w-[1200px] w-full p-10 relative max-h-[90vh] overflow-auto"
+                            onClick={(e) => e.stopPropagation()}
+                        >
+                            <button
+                                aria-label="Lukk"
+                                onClick={() => setShowAccumulatedReturn(false)}
+                                className="absolute top-3 right-3 text-[#333333]/70 hover:text-[#333333]"
+                            >
+                                ✕
+                            </button>
+                            <h3 className="typo-h3 text-[#4A6D8C] mb-6 text-[2rem]">Akkumulert avkastning Sim.</h3>
+                            <div className="chart-container">
+                                <Line 
+                                    data={{
+                                        labels: accumulatedReturnData.labels,
+                                        datasets: [
+                                            {
+                                                label: 'Akkumulert avkastning (%)',
+                                                data: accumulatedReturnData.percentValues,
+                                                borderColor: '#4A6D8C',
+                                                backgroundColor: 'rgba(74, 109, 140, 0.15)',
+                                                borderWidth: 4,
+                                                fill: true,
+                                                gradientFill: true,
+                                                tension: 0.5,
+                                                pointRadius: 0,
+                                                pointHoverRadius: 8,
+                                                pointBackgroundColor: '#ffffff',
+                                                pointBorderColor: '#4A6D8C',
+                                                pointBorderWidth: 3,
+                                                pointHoverBackgroundColor: '#ffffff',
+                                                pointHoverBorderColor: '#4A6D8C',
+                                                pointHoverBorderWidth: 4,
+                                                cubicInterpolationMode: 'monotone',
+                                                shadowOffsetX: 0,
+                                                shadowOffsetY: 3,
+                                                shadowBlur: 10,
+                                                shadowColor: 'rgba(74, 109, 140, 0.4)',
+                                                yAxisID: 'y',
+                                            },
+                                            {
+                                                label: 'Årlig avkastning (kr)',
+                                                data: accumulatedReturnData.krValues,
+                                                borderColor: '#66CCDD',
+                                                backgroundColor: 'rgba(102, 204, 221, 0.2)',
+                                                borderWidth: 3,
+                                                borderDash: [5, 5],
+                                                fill: false,
+                                                tension: 0.4,
+                                                pointRadius: 4,
+                                                pointHoverRadius: 7,
+                                                pointBackgroundColor: '#ffffff',
+                                                pointBorderColor: '#66CCDD',
+                                                pointBorderWidth: 2,
+                                                pointHoverBackgroundColor: '#66CCDD',
+                                                pointHoverBorderColor: '#ffffff',
+                                                pointHoverBorderWidth: 3,
+                                                yAxisID: 'y1',
+                                            }
+                                        ]
+                                    }}
+                                    options={{
+                                        ...chartOptions,
+                                        responsive: true,
+                                        maintainAspectRatio: false,
+                                        animation: {
+                                            duration: 2000,
+                                            easing: 'easeInOutQuart',
+                                            delay: (context) => {
+                                                if (context.type === 'data' && context.mode === 'default') {
+                                                    return context.dataIndex * 50;
+                                                }
+                                                return 0;
+                                            },
+                                        },
+                                        interaction: {
+                                            mode: 'index',
+                                            intersect: false,
+                                        },
+                                        plugins: {
+                                            ...chartOptions.plugins,
+                                            legend: {
+                                                display: true,
+                                                labels: {
+                                                    color: '#333333',
+                                                    font: {
+                                                        size: 14,
+                                                        weight: '600'
+                                                    },
+                                                    padding: 12,
+                                                    usePointStyle: true,
+                                                    pointStyle: 'circle',
+                                                    boxWidth: 8,
+                                                    boxHeight: 8,
+                                                }
+                                            },
+                                            tooltip: {
+                                                ...chartOptions.plugins.tooltip,
+                                                backgroundColor: 'rgba(255, 255, 255, 0.98)',
+                                                titleColor: '#4A6D8C',
+                                                bodyColor: '#333333',
+                                                borderColor: '#4A6D8C',
+                                                borderWidth: 2,
+                                                padding: 14,
+                                                cornerRadius: 8,
+                                                displayColors: true,
+                                                boxPadding: 6,
+                                                callbacks: {
+                                                    title: (items) => `${items[0].label}`,
+                                                    label: (context) => {
+                                                        const datasetLabel = context.dataset.label || '';
+                                                        const value = context.raw;
+                                                        if (datasetLabel.includes('%')) {
+                                                            return `Akkumulert avkastning: ${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+                                                        } else {
+                                                            return `Årlig avkastning: ${formatCurrency(value)}`;
+                                                        }
+                                                    },
+                                                    labelColor: (context) => ({
+                                                        borderColor: context.dataset.borderColor,
+                                                        backgroundColor: context.dataset.borderColor,
+                                                    }),
+                                                }
+                                            }
+                                        },
+                                        scales: {
+                                            ...chartOptions.scales,
+                                            x: {
+                                                ...chartOptions.scales.x,
+                                                title: {
+                                                    display: false
+                                                },
+                                                grid: {
+                                                    ...chartOptions.scales.x.grid,
+                                                    color: 'rgba(221, 221, 221, 0.3)',
+                                                    lineWidth: 1,
+                                                },
+                                                ticks: {
+                                                    ...chartOptions.scales.x.ticks,
+                                                    maxRotation: 0,
+                                                    minRotation: 0,
+                                                    color: '#666666',
+                                                    font: {
+                                                        size: 12,
+                                                        weight: '500'
+                                                    },
+                                                    padding: 8,
+                                                }
+                                            },
+                                            y: {
+                                                position: 'left',
+                                                title: {
+                                                    display: true,
+                                                    text: 'Akkumulert avkastning (%)',
+                                                    color: '#4A6D8C',
+                                                    font: {
+                                                        size: 13,
+                                                        weight: '600'
+                                                    }
+                                                },
+                                                grid: {
+                                                    ...chartOptions.scales.y.grid,
+                                                    color: 'rgba(221, 221, 221, 0.3)',
+                                                    lineWidth: 1,
+                                                    drawBorder: false,
+                                                },
+                                                ticks: {
+                                                    ...chartOptions.scales.y.ticks,
+                                                    callback: (value) => `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`,
+                                                    color: '#4A6D8C',
+                                                    font: {
+                                                        size: 12,
+                                                        weight: '500'
+                                                    },
+                                                    padding: 8,
+                                                },
+                                                beginAtZero: false
+                                            },
+                                            y1: {
+                                                type: 'linear',
+                                                position: 'right',
+                                                title: {
+                                                    display: true,
+                                                    text: 'Årlig avkastning (kr)',
+                                                    color: '#66CCDD',
+                                                    font: {
+                                                        size: 13,
+                                                        weight: '600'
+                                                    }
+                                                },
+                                                grid: {
+                                                    drawOnChartArea: false,
+                                                },
+                                                ticks: {
+                                                    callback: (value) => {
+                                                        if (value >= 1000000) {
+                                                            return `${(value / 1000000).toFixed(1)}M`;
+                                                        } else if (value >= 1000) {
+                                                            return `${(value / 1000).toFixed(0)}k`;
+                                                        }
+                                                        return value.toFixed(0);
+                                                    },
+                                                    color: '#66CCDD',
+                                                    font: {
+                                                        size: 12,
+                                                        weight: '500'
+                                                    },
+                                                    padding: 8,
+                                                },
+                                                beginAtZero: true
+                                            }
+                                        }
+                                    }}
+                                />
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Monte Carlo simulering modal */}
+                {showMonteCarlo && (
+                    <div
+                        className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
+                        onClick={() => setShowMonteCarlo(false)}
+                    >
+                        <div
+                            className="bg-white rounded-xl shadow-2xl max-w-[1400px] w-full relative max-h-[95vh] overflow-auto"
+                            onClick={(e) => e.stopPropagation()}
+                            style={{ margin: '2vh auto 6vh auto', padding: '40px 50px 100px 50px' }}
+                        >
+                            <button
+                                aria-label="Lukk"
+                                onClick={() => setShowMonteCarlo(false)}
+                                className="absolute top-3 right-3 text-[#333333]/70 hover:text-[#333333]"
+                            >
+                                ✕
+                            </button>
+                            <h3 className="typo-h3 text-[#4A6D8C] mb-6 text-[2rem]">Monte Carlo Simulering</h3>
+                            {monteCarloChartData ? (
+                                <div>
+                                    <div className="chart-container" style={{ height: '600px', marginTop: '20px', marginBottom: '20px', position: 'relative', clear: 'both' }}>
+                                        {/* Frekvenstabell i nederste høyre hjørne - plassert over grafikken */}
+                                        {monteCarloChartData.frequencyTable && Array.isArray(monteCarloChartData.frequencyTable) && monteCarloChartData.frequencyTable.length > 0 && (() => {
+                                            const mostFrequentValue = monteCarloChartData.frequencyTable.length > 0 
+                                                ? monteCarloChartData.frequencyTable.reduce((max, curr) => curr.count > max.count ? curr : max, monteCarloChartData.frequencyTable[0]).value
+                                                : 0;
+                                            const totalSum = monteCarloChartData.frequencyTable.reduce((sum, item) => sum + item.count, 0);
+                                            return (
+                                                <div style={{ position: 'absolute', bottom: '150px', right: '20px', backgroundColor: 'white', border: '2px solid #4A6D8C', borderRadius: '8px', boxShadow: '0 4px 6px rgba(0,0,0,0.1)', padding: '12px', minWidth: '200px', zIndex: 10 }}>
+                                                    <div className="text-xs font-bold text-[#4A6D8C] mb-2 text-center">Frekvenstabell</div>
+                                                    <div className="text-xs text-[#333333] space-y-1">
+                                                        {monteCarloChartData.frequencyTable.map((item, idx) => {
+                                                            const valueInM = (item.value / 1000000).toFixed(1).replace('.', ',');
+                                                            const isMostFrequent = item.value === mostFrequentValue;
+                                                            return (
+                                                                <div key={idx} className={`flex justify-between items-center px-2 py-1 ${isMostFrequent ? 'bg-[#66CCDD]/20 rounded font-semibold' : ''}`}>
+                                                                    <span className={isMostFrequent ? 'font-bold' : 'font-medium'}>{valueInM} M</span>
+                                                                    <span className={`${isMostFrequent ? 'font-bold' : ''} text-[#666666]`}>{item.count}</span>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                        <div className="border-t border-[#DDDDDD] mt-2 pt-2 flex justify-between items-center px-2 font-bold">
+                                                            <span>Sum:</span>
+                                                            <span>{totalSum}</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
+                                        <Line 
+                                        data={{
+                                            labels: monteCarloChartData.labels,
+                                            datasets: [
+                                                {
+                                                    label: 'Normalfordeling',
+                                                    data: monteCarloChartData.normalCurve,
+                                                    borderColor: '#4A6D8C',
+                                                    backgroundColor: 'rgba(74, 109, 140, 0.1)',
+                                                    borderWidth: 3,
+                                                    fill: true,
+                                                    tension: 0.4,
+                                                    pointRadius: 0,
+                                                    pointHoverRadius: 5,
+                                                    yAxisID: 'y'
+                                                },
+                                                {
+                                                    label: 'Simulerte resultater',
+                                                    data: monteCarloChartData.histogram,
+                                                    type: 'bar',
+                                                    backgroundColor: 'rgba(102, 204, 221, 0.6)',
+                                                    borderColor: '#66CCDD',
+                                                    borderWidth: 1,
+                                                    yAxisID: 'y'
+                                                },
+                                                {
+                                                    label: 'Gjennomsnitt',
+                                                    data: monteCarloChartData.meanLine,
+                                                    type: 'bar',
+                                                    backgroundColor: '#FF6B6B',
+                                                    borderColor: '#FF6B6B',
+                                                    borderWidth: 2,
+                                                    barThickness: 3,
+                                                    categoryPercentage: 0.1,
+                                                    barPercentage: 0.1,
+                                                    yAxisID: 'y'
+                                                },
+                                                {
+                                                    label: '1 std.avv',
+                                                    data: monteCarloChartData.meanPlusStdDevLine.map((val, idx) => 
+                                                        val > 0 || monteCarloChartData.meanMinusStdDevLine[idx] > 0 ? 
+                                                        Math.max(val, monteCarloChartData.meanMinusStdDevLine[idx]) : 0
+                                                    ),
+                                                    type: 'bar',
+                                                    backgroundColor: '#3498DB',
+                                                    borderColor: '#3498DB',
+                                                    borderWidth: 2,
+                                                    barThickness: 3,
+                                                    categoryPercentage: 0.1,
+                                                    barPercentage: 0.1,
+                                                    yAxisID: 'y'
+                                                },
+                                                {
+                                                    label: '2 std.avv',
+                                                    data: monteCarloChartData.meanPlus2StdDevLine.map((val, idx) => 
+                                                        val > 0 || monteCarloChartData.meanMinus2StdDevLine[idx] > 0 ? 
+                                                        Math.max(val, monteCarloChartData.meanMinus2StdDevLine[idx]) : 0
+                                                    ),
+                                                    type: 'bar',
+                                                    backgroundColor: '#999999',
+                                                    borderColor: '#999999',
+                                                    borderWidth: 2,
+                                                    barThickness: 3,
+                                                    categoryPercentage: 0.1,
+                                                    barPercentage: 0.1,
+                                                    yAxisID: 'y'
+                                                }
+                                            ]
+                                        }}
+                                        options={{
+                                            ...chartOptions,
+                                            responsive: true,
+                                            maintainAspectRatio: false,
+                                            plugins: {
+                                                ...chartOptions.plugins,
+                                                legend: {
+                                                    display: true,
+                                                    labels: {
+                                                        color: '#333333',
+                                                        font: {
+                                                            size: 14,
+                                                            weight: '600'
+                                                        },
+                                                        padding: 12,
+                                                        usePointStyle: true
+                                                    }
+                                                },
+                                                tooltip: {
+                                                    ...chartOptions.plugins.tooltip,
+                                                    backgroundColor: 'rgba(255, 255, 255, 0.98)',
+                                                    titleColor: '#000000',
+                                                    bodyColor: '#000000',
+                                                    borderColor: '#DDDDDD',
+                                                    borderWidth: 1,
+                                                    position: 'nearest',
+                                                    intersect: false,
+                                                    callbacks: {
+                                                        title: (items) => {
+                                                            return `Total utbetaling: ${items[0].label}`;
+                                                        },
+                                                        label: () => {
+                                                            // Ikke vis noen labels, bare tittel
+                                                            return null;
+                                                        },
+                                                        filter: () => {
+                                                            // Vis tooltip for alle elementer
+                                                            return true;
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            scales: {
+                                                x: {
+                                                    ...chartOptions.scales.x,
+                                                    title: {
+                                                        display: true,
+                                                        text: 'Total sum av utbetalinger (kr)',
+                                                        color: '#333333',
+                                                        font: {
+                                                            size: 14,
+                                                            weight: '600'
+                                                        }
+                                                    },
+                                                    stacked: false
+                                                },
+                                                y: {
+                                                    ...chartOptions.scales.y,
+                                                    title: {
+                                                        display: true,
+                                                        text: 'Antall simuleringer',
+                                                        color: '#333333',
+                                                        font: {
+                                                            size: 14,
+                                                            weight: '600'
+                                                        }
+                                                    },
+                                                    stacked: false,
+                                                    beginAtZero: true,
+                                                    max: monteCarloChartData.maxNormalCurveValue ? monteCarloChartData.maxNormalCurveValue + 10 : 100,
+                                                    ticks: {
+                                                        ...chartOptions.scales.y.ticks,
+                                                        stepSize: monteCarloChartData.maxNormalCurveValue ? Math.max(1, Math.ceil((monteCarloChartData.maxNormalCurveValue + 10) / 10)) : 10,
+                                                        callback: (value) => {
+                                                            if (value >= 1000000) {
+                                                                return `${(value / 1000000).toFixed(1).replace('.', ',')} M`;
+                                                            } else if (value >= 1000) {
+                                                                return `${(value / 1000).toFixed(1).replace('.', ',')} k`;
+                                                            }
+                                                            return Math.round(value).toString();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }}
+                                    />
+                                    </div>
+                                    <div className="mt-4 mb-4 text-center text-[#333333]" style={{ marginTop: '30px', marginBottom: '20px' }}>
+                                        <p className="text-sm">
+                                            Gjennomsnitt: {formatCurrency(monteCarloChartData.mean)}
+                                        </p>
+                                        <p className="text-sm">
+                                            Standardavvik: {formatCurrency(monteCarloChartData.stdDev)}
+                                        </p>
+                                        <p className="text-xs text-[#666666] mt-2">
+                                            Basert på {monteCarloResults.length} simuleringer
+                                        </p>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="text-center text-[#666666] py-8">
+                                    Ingen simulering tilgjengelig. Sørg for at utbetalingsperiode er satt til mer enn 0 år.
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {/* Monte Carlo Portefølje simulering modal */}
+                {showMonteCarloPortfolio && (
+                    <div
+                        className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
+                        onClick={() => setShowMonteCarloPortfolio(false)}
+                    >
+                        <div
+                            className="bg-white rounded-xl shadow-2xl max-w-[1400px] w-full relative max-h-[95vh] overflow-auto"
+                            onClick={(e) => e.stopPropagation()}
+                            style={{ margin: '2vh auto 6vh auto', padding: '40px 50px 100px 50px' }}
+                        >
+                            <button
+                                aria-label="Lukk"
+                                onClick={() => setShowMonteCarloPortfolio(false)}
+                                className="absolute top-3 right-3 text-[#333333]/70 hover:text-[#333333]"
+                            >
+                                ✕
+                            </button>
+                            <h3 className="typo-h3 text-[#4A6D8C] mb-6 text-[2rem]">Monte Carlo Simulering</h3>
+                            {monteCarloPortfolioChartData ? (
+                                <div>
+                                    <div className="chart-container" style={{ height: '600px', marginTop: '20px', marginBottom: '20px', position: 'relative', clear: 'both' }}>
+                                        {/* Frekvenstabell i nederste høyre hjørne - plassert over grafikken */}
+                                        {monteCarloPortfolioChartData.frequencyTable && Array.isArray(monteCarloPortfolioChartData.frequencyTable) && monteCarloPortfolioChartData.frequencyTable.length > 0 && (() => {
+                                            const mostFrequentValue = monteCarloPortfolioChartData.frequencyTable.length > 0 
+                                                ? monteCarloPortfolioChartData.frequencyTable.reduce((max, curr) => curr.count > max.count ? curr : max, monteCarloPortfolioChartData.frequencyTable[0]).value
+                                                : 0;
+                                            const totalSum = monteCarloPortfolioChartData.frequencyTable.reduce((sum, item) => sum + item.count, 0);
+                                            return (
+                                                <div style={{ position: 'absolute', bottom: '150px', right: '20px', backgroundColor: 'white', border: '2px solid #4A6D8C', borderRadius: '8px', boxShadow: '0 4px 6px rgba(0,0,0,0.1)', padding: '12px', minWidth: '200px', zIndex: 10 }}>
+                                                    <div className="text-xs font-bold text-[#4A6D8C] mb-2 text-center">Frekvenstabell</div>
+                                                    <div className="text-xs text-[#333333] space-y-1">
+                                                        {monteCarloPortfolioChartData.frequencyTable.map((item, idx) => {
+                                                            const valueInM = (item.value / 1000000).toFixed(1).replace('.', ',');
+                                                            const isMostFrequent = item.value === mostFrequentValue;
+                                                            return (
+                                                                <div key={idx} className={`flex justify-between items-center px-2 py-1 ${isMostFrequent ? 'bg-[#66CCDD]/20 rounded font-semibold' : ''}`}>
+                                                                    <span className={isMostFrequent ? 'font-bold' : 'font-medium'}>{valueInM} M</span>
+                                                                    <span className={`${isMostFrequent ? 'font-bold' : ''} text-[#666666]`}>{item.count}</span>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                        <div className="border-t border-[#DDDDDD] mt-2 pt-2 flex justify-between items-center px-2 font-bold">
+                                                            <span>Sum:</span>
+                                                            <span>{totalSum}</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
+                                        <Line 
+                                        data={{
+                                            labels: monteCarloPortfolioChartData.labels,
+                                            datasets: [
+                                                {
+                                                    label: 'Normalfordeling',
+                                                    data: monteCarloPortfolioChartData.normalCurve,
+                                                    borderColor: '#4A6D8C',
+                                                    backgroundColor: 'rgba(74, 109, 140, 0.1)',
+                                                    borderWidth: 3,
+                                                    fill: true,
+                                                    tension: 0.4,
+                                                    pointRadius: 0,
+                                                    pointHoverRadius: 5,
+                                                    yAxisID: 'y'
+                                                },
+                                                {
+                                                    label: 'Simulerte resultater',
+                                                    data: monteCarloPortfolioChartData.histogram,
+                                                    type: 'bar',
+                                                    backgroundColor: 'rgba(102, 204, 221, 0.6)',
+                                                    borderColor: '#66CCDD',
+                                                    borderWidth: 1,
+                                                    yAxisID: 'y'
+                                                },
+                                                {
+                                                    label: 'Gjennomsnitt',
+                                                    data: monteCarloPortfolioChartData.meanLine,
+                                                    type: 'bar',
+                                                    backgroundColor: '#FF6B6B',
+                                                    borderColor: '#FF6B6B',
+                                                    borderWidth: 2,
+                                                    barThickness: 3,
+                                                    categoryPercentage: 0.1,
+                                                    barPercentage: 0.1,
+                                                    yAxisID: 'y'
+                                                },
+                                                {
+                                                    label: '1 std.avv',
+                                                    data: monteCarloPortfolioChartData.meanPlusStdDevLine.map((val, idx) => 
+                                                        val > 0 || monteCarloPortfolioChartData.meanMinusStdDevLine[idx] > 0 ? 
+                                                        Math.max(val, monteCarloPortfolioChartData.meanMinusStdDevLine[idx]) : 0
+                                                    ),
+                                                    type: 'bar',
+                                                    backgroundColor: '#3498DB',
+                                                    borderColor: '#3498DB',
+                                                    borderWidth: 2,
+                                                    barThickness: 3,
+                                                    categoryPercentage: 0.1,
+                                                    barPercentage: 0.1,
+                                                    yAxisID: 'y'
+                                                },
+                                                {
+                                                    label: '2 std.avv',
+                                                    data: monteCarloPortfolioChartData.meanPlus2StdDevLine.map((val, idx) => 
+                                                        val > 0 || monteCarloPortfolioChartData.meanMinus2StdDevLine[idx] > 0 ? 
+                                                        Math.max(val, monteCarloPortfolioChartData.meanMinus2StdDevLine[idx]) : 0
+                                                    ),
+                                                    type: 'bar',
+                                                    backgroundColor: '#999999',
+                                                    borderColor: '#999999',
+                                                    borderWidth: 2,
+                                                    barThickness: 3,
+                                                    categoryPercentage: 0.1,
+                                                    barPercentage: 0.1,
+                                                    yAxisID: 'y'
+                                                }
+                                            ]
+                                        }}
+                                        options={{
+                                            ...chartOptions,
+                                            responsive: true,
+                                            maintainAspectRatio: false,
+                                            plugins: {
+                                                ...chartOptions.plugins,
+                                                legend: {
+                                                    display: true,
+                                                    labels: {
+                                                        color: '#333333',
+                                                        font: {
+                                                            size: 14,
+                                                            weight: '600'
+                                                        },
+                                                        padding: 12,
+                                                        usePointStyle: true
+                                                    }
+                                                },
+                                                tooltip: {
+                                                    ...chartOptions.plugins.tooltip,
+                                                    backgroundColor: 'rgba(255, 255, 255, 0.98)',
+                                                    titleColor: '#000000',
+                                                    bodyColor: '#000000',
+                                                    borderColor: '#DDDDDD',
+                                                    borderWidth: 1,
+                                                    position: 'nearest',
+                                                    intersect: false,
+                                                    callbacks: {
+                                                        title: (items) => {
+                                                            return `Porteføljeverdi: ${items[0].label}`;
+                                                        },
+                                                        label: () => {
+                                                            // Ikke vis noen labels, bare tittel
+                                                            return null;
+                                                        },
+                                                        filter: () => {
+                                                            // Vis tooltip for alle elementer
+                                                            return true;
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            scales: {
+                                                x: {
+                                                    ...chartOptions.scales.x,
+                                                    title: {
+                                                        display: true,
+                                                        text: 'Porteføljens totale verdi (kr)',
+                                                        color: '#333333',
+                                                        font: {
+                                                            size: 14,
+                                                            weight: '600'
+                                                        }
+                                                    },
+                                                    stacked: false
+                                                },
+                                                y: {
+                                                    ...chartOptions.scales.y,
+                                                    title: {
+                                                        display: true,
+                                                        text: 'Antall simuleringer',
+                                                        color: '#333333',
+                                                        font: {
+                                                            size: 14,
+                                                            weight: '600'
+                                                        }
+                                                    },
+                                                    stacked: false,
+                                                    beginAtZero: true,
+                                                    max: monteCarloPortfolioChartData.maxNormalCurveValue ? monteCarloPortfolioChartData.maxNormalCurveValue + 10 : 100,
+                                                    ticks: {
+                                                        ...chartOptions.scales.y.ticks,
+                                                        stepSize: monteCarloPortfolioChartData.maxNormalCurveValue ? Math.max(1, Math.ceil((monteCarloPortfolioChartData.maxNormalCurveValue + 10) / 10)) : 10,
+                                                        callback: (value) => {
+                                                            if (value >= 1000000) {
+                                                                return `${(value / 1000000).toFixed(1).replace('.', ',')} M`;
+                                                            } else if (value >= 1000) {
+                                                                return `${(value / 1000).toFixed(1).replace('.', ',')} k`;
+                                                            }
+                                                            return Math.round(value).toString();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }}
+                                    />
+                                    </div>
+                                    <div className="mt-4 mb-4 text-center text-[#333333]" style={{ marginTop: '30px', marginBottom: '20px' }}>
+                                        <p className="text-sm">
+                                            Gjennomsnitt: {formatCurrency(monteCarloPortfolioChartData.mean)}
+                                        </p>
+                                        <p className="text-sm">
+                                            Standardavvik: {formatCurrency(monteCarloPortfolioChartData.stdDev)}
+                                        </p>
+                                        <p className="text-xs text-[#666666] mt-2">
+                                            Basert på {monteCarloPortfolioResults.length} simuleringer
+                                        </p>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="text-center text-[#666666] py-8">
+                                    Ingen simulering tilgjengelig. Sørg for at investeringsperiode er satt til mer enn 0 år.
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )}
+
                 <div className="relative">
                     <EyeToggle visible={showInvestedCapitalGraphic} onToggle={() => setShowInvestedCapitalGraphic(v => !v)} />
                     {showInvestedCapitalGraphic && (
@@ -3086,6 +4500,8 @@ Alle uttak fra et as vil i modellen ansees som et utbytte. Om det er innskutt ka
                                 <SliderInput id="shieldingRate" label="Skjermingsrente" value={state.shieldingRate} min={2} max={7} step={0.01} onChange={handleStateChange} displayValue={`${state.shieldingRate.toFixed(2)}%`} />
                                 <ManualTaxInput id="manualStockTaxRate" label="Utbytteskatt / skatt aksjer (%)" value={state.manualStockTaxRate} onChange={handleStateChange} />
                                 <ManualTaxInput id="manualBondTaxRate" label="Kapitalskatt (%)" value={state.manualBondTaxRate} onChange={handleStateChange} />
+                                <SliderInput id="stockStdDev" label="Standardavvik aksjer" value={state.stockStdDev} min={5} max={20} step={0.1} onChange={handleStateChange} displayValue={`${state.stockStdDev.toFixed(1)}%`} />
+                                <SliderInput id="bondStdDev" label="Standardavvik renter" value={state.bondStdDev} min={1} max={8} step={0.1} onChange={handleStateChange} displayValue={`${state.bondStdDev.toFixed(1)}%`} />
                             </div>
                         </div>
                     </div>

@@ -1174,8 +1174,8 @@ const [inputText, setInputText] = useState('');
         
         const stockReturns = [];
         const bondReturns = [];
-        const stockStdDev = state.stockStdDev || 12.0; // Standardavvik for aksjer fra state
-        const bondStdDev = state.bondStdDev || 3.0; // Standardavvik for renter fra state
+        const stockStdDev = state.stockStdDev; // Standardavvik for aksjer fra slider
+        const bondStdDev = state.bondStdDev; // Standardavvik for renter fra slider
         const stockMean = state.stockReturnRate || 8.0; // Forventet avkastning aksjer
         const bondMean = state.bondReturnRate || 5.0; // Forventet avkastning renter
         
@@ -1329,8 +1329,8 @@ const [inputText, setInputText] = useState('');
         const totalYears = state.investmentYears + state.payoutYears;
         if (totalYears === 0 || state.payoutYears === 0) return [];
         
-        const stockStdDev = state.stockStdDev || 12.0; // Standardavvik for aksjer fra state
-        const bondStdDev = state.bondStdDev || 3.0; // Standardavvik for renter fra state
+        const stockStdDev = state.stockStdDev; // Standardavvik for aksjer fra slider
+        const bondStdDev = state.bondStdDev; // Standardavvik for renter fra slider
         const stockMean = state.stockReturnRate || 8.0;
         const bondMean = state.bondReturnRate || 5.0;
         
@@ -1583,8 +1583,8 @@ const [inputText, setInputText] = useState('');
         
         if (state.investmentYears === 0) return [];
         
-        const stockStdDev = state.stockStdDev || 12.0; // Standardavvik for aksjer fra state
-        const bondStdDev = state.bondStdDev || 3.0; // Standardavvik for renter fra state
+        const stockStdDev = state.stockStdDev; // Standardavvik for aksjer fra slider
+        const bondStdDev = state.bondStdDev; // Standardavvik for renter fra slider
         const stockMean = state.stockReturnRate || 8.0;
         const bondMean = state.bondReturnRate || 5.0;
         
@@ -3254,7 +3254,7 @@ return () => document.removeEventListener('keydown', onKey);
                         className="bg-[#999999] border border-[#DDDDDD] text-white hover:bg-[#888888] h-16 rounded-2xl flex items-center justify-center text-center p-2 text-sm font-medium transition-all hover:-translate-y-0.5 shadow-md"
                         style={{ flex: '1 1 0', minWidth: '0', maxWidth: '100%', marginRight: '10px' }}
                     >
-                        Simulering<br />år for år
+                        Sim.<br />år for år
                     </button>
                     <button
                         type="button"
@@ -3267,7 +3267,7 @@ return () => document.removeEventListener('keydown', onKey);
                         className="bg-[#3498DB] border border-[#DDDDDD] text-white hover:bg-[#2980B9] h-16 rounded-2xl flex items-center justify-center text-center p-2 text-sm font-medium transition-all hover:-translate-y-0.5 shadow-md"
                         style={{ flex: '1 1 0', minWidth: '0', maxWidth: '100%', marginRight: '10px' }}
                     >
-                        Simulering,<br />akkumulert avkastning
+                        Sim.<br />kr og %
                     </button>
                     <button
                         type="button"
@@ -3835,15 +3835,7 @@ Alle uttak fra et as vil i modellen ansees som et utbytte. Om det er innskutt ka
                                             },
                                             y: {
                                                 position: 'left',
-                                                title: {
-                                                    display: true,
-                                                    text: 'Akkumulert avkastning (%)',
-                                                    color: '#4A6D8C',
-                                                    font: {
-                                                        size: 13,
-                                                        weight: '600'
-                                                    }
-                                                },
+                                                title: { display: false },
                                                 grid: {
                                                     ...chartOptions.scales.y.grid,
                                                     color: 'rgba(221, 221, 221, 0.3)',
@@ -3855,25 +3847,19 @@ Alle uttak fra et as vil i modellen ansees som et utbytte. Om det er innskutt ka
                                                     callback: (value) => `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`,
                                                     color: '#4A6D8C',
                                                     font: {
-                                                        size: 12,
+                                                        size: 14.4,
                                                         weight: '500'
                                                     },
                                                     padding: 8,
+                                                    maxRotation: 0,
+                                                    minRotation: 0,
                                                 },
                                                 beginAtZero: false
                                             },
                                             y1: {
                                                 type: 'linear',
                                                 position: 'right',
-                                                title: {
-                                                    display: true,
-                                                    text: 'Årlig avkastning (kr)',
-                                                    color: '#66CCDD',
-                                                    font: {
-                                                        size: 13,
-                                                        weight: '600'
-                                                    }
-                                                },
+                                                title: { display: false },
                                                 grid: {
                                                     drawOnChartArea: false,
                                                 },
@@ -3888,10 +3874,12 @@ Alle uttak fra et as vil i modellen ansees som et utbytte. Om det er innskutt ka
                                                     },
                                                     color: '#66CCDD',
                                                     font: {
-                                                        size: 12,
+                                                        size: 14.4,
                                                         weight: '500'
                                                     },
                                                     padding: 8,
+                                                    maxRotation: 0,
+                                                    minRotation: 0,
                                                 },
                                                 beginAtZero: true
                                             }
@@ -3921,7 +3909,7 @@ Alle uttak fra et as vil i modellen ansees som et utbytte. Om det er innskutt ka
                             >
                                 ✕
                             </button>
-                            <h3 className="typo-h3 text-[#4A6D8C] mb-6 text-[2rem]">Monte Carlo Simulering</h3>
+                            <h3 className="typo-h3 text-[#4A6D8C] mb-6 text-[2rem]">Estimert sum utbetalinger alle år</h3>
                             {monteCarloChartData ? (
                                 <div>
                                     <div className="chart-container" style={{ height: '600px', marginTop: '20px', marginBottom: '20px', position: 'relative', clear: 'both' }}>
@@ -4148,7 +4136,7 @@ Alle uttak fra et as vil i modellen ansees som et utbytte. Om det er innskutt ka
                             >
                                 ✕
                             </button>
-                            <h3 className="typo-h3 text-[#4A6D8C] mb-6 text-[2rem]">Monte Carlo Simulering</h3>
+                            <h3 className="typo-h3 text-[#4A6D8C] mb-6 text-[2rem]">Estimert verdi på porteføljen siste år før utbetalinger starter</h3>
                             {monteCarloPortfolioChartData ? (
                                 <div>
                                     <div className="chart-container" style={{ height: '600px', marginTop: '20px', marginBottom: '20px', position: 'relative', clear: 'both' }}>
